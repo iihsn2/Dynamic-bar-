@@ -98,4 +98,227 @@ class IslandService : AccessibilityService() {
         IslandBus.listener?.republish()
     }
 
-    override fun onAcces
+        override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+    override fun onInterrupt() {}
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        landscape = newConfig.orientation == Configuration.ORIENTATION_LANDSCAPE
+        if (view != null) rebuild()
+    }
+
+    override fun onDestroy() {
+        IslandBus.service = null
+        if (receiverRegistered) {
+            try { unregisterReceiver(receiver) } catch (_: Exception) {}
+            receiverRegistered = false
+        }
+        teardown()
+        super.onDestroy()
+    }
+
+    // ------------------------------------------------------------------
+    // بناء النافذة
+    // ------------------------------------------------------------------
+
+    fun rebuild() {
+        handler.post {
+            val keepMedia = media
+            build()
+            if (keepMedia != null) onMedia(keepMedia)
+        }
+    }
+
+    private fun teardown() {
+        handler.removeCallbacksAndMessages(null)
+        view?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+        view = null
+        lp = null
+    }
+        private fun build() {
+        teardown()
+        state = IslandState.IDLE
+        val m = resources.displayMetrics
+        dims = Dims(this, Prefs.idleW(this), Prefs.idleH(this), m.widthPixels)
+
+        val v = IslandView(this, dims)
+        v.snapTo(dims.idleW, dims.idleH)
+        v.onTap = { onTap() }
+        v.onLongPress = { if (state == IslandState.COMPACT || state == IslandState.MUSIC) openMusicApp() }
+        v.onSwipeUp = { if (state == IslandState.NOTIF || state == IslandState.MUSIC) setState(rest()) }
+        v.btnPlay.setOnClickListener {
+            val c = media?.controller?.transportControls ?: return@setOnClickListener
+            if (media?.playing == true) c.pause() else c.play()
+            keepMusicOpen()
+        }
+        v.btnNext.setOnClickListener { media?.controller?.transportControls?.skipToNext(); keepMusicOpen() }
+        v.btnPrev.setOnClickListener { media?.controller?.transportControls?.skipToPrevious(); keepMusicOpen() }
+        v.setArtClick { openMusicApp() }
+
+        val p = WindowManager.LayoutParams(
+            (dims.idleW + 2 * padX).toInt(),
+            (dims.idleH + padY).toInt(),
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            baseFlags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+            PixelFormat.TRANSLUCENT
+        )
+        p.gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+        p.y = dpi(Prefs.offsetY(this).toFloat())
+        p.title = "DynamicIsland"
+        if (Build.VERSION.SDK_INT >= 30) {
+            p.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+        } else if (Build.VERSION.SDK_INT >= 28) {
+            p.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
+
+        view = v
+        lp = p
+        v.visibility = if (landscape) android.view.View.GONE else android.view.View.VISIBLE
+        try { wm.addView(v, p) } catch (_: Exception) {}
+    }
+
+    private fun applyWindow(w: Float, h: Float, touchable: Boolean) {
+        val v = view ?: return
+        val p = lp ?: return
+        p.width = w.toInt()
+        p.height = h.toInt()
+        p.flags = baseFlags or (if (touchable) 0 else WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE)
+        try { wm.updateViewLayout(v, p) } catch (_: Exception) {}
+    }
+        private fun rest(): IslandState = if (media?.playing == true) IslandState.COMPACT else IslandState.IDLE
+
+    private fun setState(s: IslandState) {
+        val v = view ?: return
+        val p = lp ?: return
+        if (s == state) return
+        val prev = state
+        state = s
+
+        applyWindow(
+            max(p.width.toFloat(), dims.w(s) + 2 * padX),
+            max(p.height.toFloat(), dims.h(s) + padY),
+            s != IslandState.IDLE
+        )
+        v.showContent(prev, s)
+        v.onSettled = {
+            if (state == s) applyWindow(dims.w(s) + 2 * padX, dims.h(s) + padY, s != IslandState.IDLE)
+        }
+        v.animateTo(dims.w(s), dims.h(s))
+
+        handler.removeCallbacks(ticker)
+        if (s == IslandState.MUSIC) {
+            ticker.run()
+            postRest(9000)
+        }
+    }
+
+    private fun postRest(delay: Long) {
+        handler.removeCallbacks(restRunnable)
+        handler.postDelayed(restRunnable, delay)
+    }
+
+    private fun keepMusicOpen() { if (state == IslandState.MUSIC) postRest(9000) }
+
+    private fun resetQuietly() {
+        handler.removeCallbacks(restRunnable)
+        handler.removeCallbacks(openLockRunnable)
+        setState(rest())
+    }
+
+    private fun onTap() {
+        when (state) {
+            IslandState.COMPACT -> if (media != null) setState(IslandState.MUSIC)
+            IslandState.MUSIC -> setState(rest())
+            IslandState.NOTIF -> openNotification()
+            else -> {}
+        }
+    }
+
+    private fun openNotification() {
+        val n = notif
+        if (n != null) {
+            try {
+                if (n.intent != null) n.intent.send()
+                else packageManager.getLaunchIntentForPackage(n.pkg)?.let {
+                    it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    startActivity(it)
+                }
+            } catch (_: Exception) {
+                packageManager.getLaunchIntentForPackage(n.pkg)?.let {
+                    it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    try { startActivity(it) } catch (_: Exception) {}
+                }
+            }
+        }
+        handler.removeCallbacks(restRunnable)
+        setState(rest())
+    }
+
+    private fun openMusicApp() {
+        val pkg = media?.controller?.packageName ?: return
+        packageManager.getLaunchIntentForPackage(pkg)?.let {
+            it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            try { startActivity(it) } catch (_: Exception) {}
+        }
+        setState(rest())
+    }
+
+    fun onMedia(info: MediaInfo?) {
+        handler.post {
+            media = info
+            if (info != null) view?.bindMedia(info)
+            when (state) {
+                IslandState.IDLE, IslandState.COMPACT -> setState(rest())
+                IslandState.MUSIC -> if (info == null) setState(rest())
+                else -> {}
+            }
+        }
+    }
+
+    fun onNotification(n: NotifData) {
+        handler.post {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            if (!pm.isInteractive || landscape) return@post
+            notif = n
+            view?.bindNotif(n)
+            handler.removeCallbacks(openLockRunnable)
+            setState(IslandState.NOTIF)
+            postRest(4500)
+        }
+    }
+
+    private fun playLock(unlock: Boolean) {
+        handler.post {
+            val v = view ?: return@post
+            if (landscape) return@post
+            handler.removeCallbacks(restRunnable)
+            handler.removeCallbacks(openLockRunnable)
+            if (state != IslandState.LOCK) v.lockView.open = 0f
+            setState(IslandState.LOCK)
+            if (unlock) {
+                handler.postDelayed(openLockRunnable, 260)
+                postRest(1350)
+            } else {
+                postRest(1500)
+            }
+        }
+    }
+
+    private fun animateLockOpen() {
+        val lv = view?.lockView ?: return
+        ValueAnimator.ofFloat(lv.open, 1f).apply {
+            duration = 380
+            interpolator = OvershootInterpolator(2.2f)
+            addUpdateListener { lv.open = it.animatedValue as Float }
+            start()
+        }
+    }
+
+    fun demoNotification() {
+        val icon = try { drawableToBitmap(packageManager.getApplicationIcon(packageName)) } catch (_: Exception) { null }
+        onNotification(NotifData("Dynamic Island", "هيك رح تظهر الإشعارات عندك 🎉", icon, null, packageName))
+    }
+
+    fun demoLock() = playLock(false)
+    fun demoUnlock() = playLock(true)
+}
